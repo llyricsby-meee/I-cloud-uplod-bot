@@ -1,0 +1,3 @@
+pyicloud==1.1.0
+yt-dlp
+pyTelegramBotAPI
