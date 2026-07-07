@@ -1,4 +1,3 @@
 pytelebotapi
 yt-dlp
-pyicloud-ipsw
 flask
