@@ -1,4 +1,4 @@
 pytelebotapi
 yt-dlp
-git+https://github.com/pickle95/pyicloud.git@master
+pyicloud-ipsw
 flask
