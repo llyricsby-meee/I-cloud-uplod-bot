@@ -1,4 +1,13 @@
+import subprocess
+import sys
 import os
+
+# वर्सल के नखरेबाज़ पैकेज मैनेजर को बायपास करके रनटाइम पर pyicloud इंस्टॉल करना
+try:
+    import pyicloud
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyicloud==1.1.0"])
+
 import telebot
 from yt_dlp import YoutubeDL
 from pyicloud import PyiCloudService
