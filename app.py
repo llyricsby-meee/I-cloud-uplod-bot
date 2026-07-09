@@ -1,16 +1,20 @@
 import os
+import shutil
 import threading
 import telebot
 from pyicloud import PyiCloudService
 from flask import Flask
 
-# Environment Variables (रेंडर के डैशबोर्ड से लोड होंगे)
+# Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 APPLE_ID = os.environ.get("your_apple_id")
 APPLE_PASSWORD = os.environ.get("your_apple_password")
 
-# 🍪 रेंडर की Secret Files का डिफ़ॉल्ट रास्ता
-COOKIE_DIR = "/etc/secrets"
+# 🍪 रेंडर की Secret Files का पाथ जहाँ आपकी कुकी रखी है
+RENDER_SECRETS_DIR = "/etc/secrets"
+
+# 🛠️ वर्किंग पाथ जहाँ कोड कुकी को मॉडिफ़ाई कर पाएगा (Read-Write Allowed)
+WORKING_COOKIE_DIR = "/tmp/icloud_cookies"
 
 app = Flask(__name__)
 bot = None
@@ -29,17 +33,38 @@ saved_file_type = None
 
 @app.route('/')
 def home():
-    return "iCloud Direct Upload Bot is Running Successfully!"
+    return "iCloud Read-Write Fixed Bot is Live!"
 
 def run_flask():
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
+def setup_cookies():
+    """यह फ़ंक्शन Read-only कुकी को उठाकर लिखने योग्य /tmp फ़ोल्डर में कॉपी करेगा"""
+    if not os.path.exists(WORKING_COOKIE_DIR):
+        os.makedirs(WORKING_COOKIE_DIR)
+    
+    # रेंडर की सीक्रेट डायरेक्टरी में जो भी कुकीज़ हैं उन्हें /tmp में कॉपी करो
+    if os.path.exists(RENDER_SECRETS_DIR):
+        for filename in os.listdir(RENDER_SECRETS_DIR):
+            src_file = os.path.join(RENDER_SECRETS_DIR, filename)
+            dest_file = os.path.join(WORKING_COOKIE_DIR, filename)
+            if os.path.isfile(src_file):
+                try:
+                    shutil.copy2(src_file, dest_file)
+                    # फ़ाइल को पूरी परमिशन दे रहे हैं ताकि एरर न आए
+                    os.chmod(dest_file, 0o777)
+                except Exception as e:
+                    print(f"कुकी कॉपी एरर: {e}")
+
 def init_icloud(chat_id):
     global api, waiting_for_2fa
     try:
-        # यह सीधे /etc/secrets में मौजूद आपकी कुकी फ़ाइल से लॉगिन करेगा
-        api = PyiCloudService(APPLE_ID, APPLE_PASSWORD, cookie_directory=COOKIE_DIR)
+        # लॉगिन से पहले कुकीज़ को सही जगह सेटअप करें
+        setup_cookies()
+        
+        # अब यह /tmp वाले फ़ोल्डर से कुकी यूज़ करेगा जहाँ लिखने की आज़ादी है
+        api = PyiCloudService(APPLE_ID, APPLE_PASSWORD, cookie_directory=WORKING_COOKIE_DIR)
         
         if api.requires_2fa:
             bot.send_message(chat_id, "🔐 कुकी मैच नहीं हुई या एक्सपायर हो गई है। कृपया नया 2FA कोड भेजें।")
@@ -59,14 +84,12 @@ def upload_after_login(chat_id, file_id, default_name, file_type):
         ext = file_info.file_path.split('.')[-1]
         filename = f"{default_name}_{file_id[:6]}.{ext}"
         
-        # लोकल सर्वर पर फाइल डाउनलोड करना
         downloaded_file = bot.download_file(file_info.file_path)
         with open(filename, 'wb') as new_file:
             new_file.write(downloaded_file)
             
-        bot.send_message(chat_id, "📥 डाउनलोड पूरा! अब सेव की हुई कुकी के ज़रिए iCloud Drive पर भेजा जा रहा है...")
+        bot.send_message(chat_id, "📥 डाउनलोड पूरा! अब सुरक्षित कुकी के ज़रिए iCloud Drive पर भेजा जा रहा है...")
         
-        # 🔥 100% वर्किंग नया अपलोड सिंटैक्स (जिससे DriveNode एरर नहीं आएगा)
         with open(filename, 'rb') as file_obj:
             api.drive.upload_file(file_obj, filename=filename)
             
@@ -74,7 +97,6 @@ def upload_after_login(chat_id, file_id, default_name, file_type):
     except Exception as e:
         bot.send_message(chat_id, f"❌ अपलोड फेल: {str(e)}")
     finally:
-        # काम होने के बाद सर्वर से कचरा फाइल डिलीट करना
         if filename and os.path.exists(filename):
             os.remove(filename)
 
@@ -101,7 +123,7 @@ if bot:
                     bot.send_message(chat_id, f"❌ एरर: {str(e)}")
             return
 
-        bot.reply_to(message, "👋 नमस्ते भाई! कुकीज़ लोड हो चुकी हैं। मुझे सीधे कोई भी फोटो या फाइल भेजो, बिना 2FA के अपलोड हो जाएगी!")
+        bot.reply_to(message, "👋 नमस्ते भाई! कुकीज़ लोड हो चुकी हैं। मुझे कोई भी फाइल भेजो, बिना 2FA के अपलोड हो जाएगी!")
 
     def handle_incoming_file(message, file_id, default_name, file_type):
         global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
