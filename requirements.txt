@@ -1,4 +1,4 @@
 pyTelegramBotAPI
 pyicloud
 flask
-yt-dlp
+requests
