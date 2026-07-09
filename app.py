@@ -1,126 +1,220 @@
 import os
 import time
+import shutil
 import threading
-import queue
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyicloud import PyiCloudService
 from flask import Flask
 import yt_dlp
 
-# --- Credentials ---
+# Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-APPLE_ID = os.environ.get("APPLE_ID")
-APPLE_PASSWORD = os.environ.get("APPLE_PASSWORD")
+APPLE_ID = os.environ.get("your_apple_id")
+APPLE_PASSWORD = os.environ.get("your_apple_password")
+
+RENDER_SECRETS_DIR = "/etc/secrets"
+WORKING_COOKIE_DIR = "/tmp/icloud_cookies"
 
 app = Flask(__name__)
-bot = telebot.TeleBot(BOT_TOKEN.strip())
+bot = None
+
+if BOT_TOKEN:
+    try:
+        bot = telebot.TeleBot(BOT_TOKEN.strip())
+    except Exception as e:
+        print(f"❌ बॉट सेट करने में गड़बड़: {str(e)}")
 
 api = None
-file_queue = queue.Queue()
-last_update_time = {} # Telegram स्पैम से बचने के लिए
+waiting_for_2fa = False
+last_update_time = {}
 
-# --- Flask Server (Render के लिए) ---
+# --- Flask Server ---
 @app.route('/')
 def home():
     return "iCloud Pro Bot is Running! 🚀"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# --- iCloud Setup ---
-def setup_icloud():
-    global api
-    if api is None:
-        api = PyiCloudService(APPLE_ID, APPLE_PASSWORD)
-    return api
+def setup_cookies():
+    if not os.path.exists(WORKING_COOKIE_DIR):
+        os.makedirs(WORKING_COOKIE_DIR)
+    if os.path.exists(RENDER_SECRETS_DIR):
+        for filename in os.listdir(RENDER_SECRETS_DIR):
+            src = os.path.join(RENDER_SECRETS_DIR, filename)
+            dest = os.path.join(WORKING_COOKIE_DIR, filename)
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, dest)
+                    os.chmod(dest, 0o777)
+                except:
+                    pass
 
-# --- Progress Bar (Telegram Update) ---
+def init_icloud(chat_id):
+    global api, waiting_for_2fa
+    setup_cookies()
+    try:
+        api = PyiCloudService(APPLE_ID, APPLE_PASSWORD, cookie_directory=WORKING_COOKIE_DIR)
+        if api.requires_2fa:
+            bot.send_message(chat_id, "🔐 कुकी एक्सपायर है। नया 2FA कोड भेजें।")
+            waiting_for_2fa = True
+            return False
+        return True
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ iCloud लॉगिन एरर: {str(e)}")
+        return False
+
+# --- YouTube Progress Hook ---
 def progress_hook(d, chat_id, message_id):
     if d['status'] == 'downloading':
         now = time.time()
-        # हर 3 सेकंड में अपडेट करेगा ताकि Telegram ब्लॉक न करे
         if now - last_update_time.get(message_id, 0) > 3:
             p = d.get('_percent_str', 'N/A').strip()
             s = d.get('_speed_str', 'N/A').strip()
             try:
                 bot.edit_message_text(
-                    chat_id=chat_id, 
-                    message_id=message_id, 
+                    chat_id=chat_id, message_id=message_id, 
                     text=f"⏳ सर्वर पर डाउनलोड हो रहा है...\n📊 प्रोग्रेस: {p}\n🚀 स्पीड: {s}"
                 )
                 last_update_time[message_id] = now
-            except Exception:
-                pass # अगर सेम मैसेज एडिट हो तो एरर इग्नोर करो
+            except:
+                pass
 
-# --- Queue Processor (Background Task) ---
-def process_queue():
-    while True:
-        task = file_queue.get()
-        chat_id = task['chat_id']
-        link = task['link']
-        is_audio = task['is_audio']
+# --- Direct Download & Upload Function ---
+def process_youtube_download(chat_id, link, is_audio):
+    global api
+    if api is None and not init_icloud(chat_id):
+        return
+
+    msg = bot.send_message(chat_id, "🚀 YouTube से सीधे डाउनलोडिंग शुरू की जा रही है...")
+    
+    try:
+        ydl_opts = {
+            'format': 'bestaudio/best' if is_audio else 'best',
+            'outtmpl': 'downloaded_media.%(ext)s',
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+            'progress_hooks': [lambda d: progress_hook(d, chat_id, msg.message_id)]
+        }
         
-        # प्रोग्रेस दिखाने के लिए पहला मैसेज
-        msg = bot.send_message(chat_id, "🚀 डाउनलोडिंग शुरू की जा रही है...")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(link, download=True)
+            file_ext = info.get('ext', 'mp3' if is_audio else 'mp4')
+            file_name = f"downloaded_media.{file_ext}"
+            title = info.get('title', 'Media')
+
+        bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"☁️ '{title}' को iCloud पर अपलोड कर रहा हूँ...")
         
+        with open(file_name, 'rb') as f:
+            api.drive.root.upload(f)
+        
+        bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"✅ '{title}' सफलतापूर्वक iCloud पर सेव हो गई! 🎉")
+        os.remove(file_name)
+        
+    except Exception as e:
+        bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"❌ कुछ गड़बड़ हुई: {str(e)}")
+
+def process_telegram_upload(chat_id, file_id, default_name):
+    global api
+    if api is None and not init_icloud(chat_id):
+        return
+        
+    bot.send_message(chat_id, "⏳ फाइल डाउनलोड हो रही है...")
+    filename = None
+    try:
+        file_info = bot.get_file(file_id)
+        ext = file_info.file_path.split('.')[-1]
+        filename = f"{default_name}_{file_id[:6]}.{ext}"
+        
+        downloaded_file = bot.download_file(file_info.file_path)
+        with open(filename, 'wb') as new_file:
+            new_file.write(downloaded_file)
+            
+        bot.send_message(chat_id, "📥 डाउनलोड पूरा! iCloud Drive पर भेजा जा रहा है...")
+        with open(filename, 'rb') as file_obj:
+            api.drive.root.upload(file_obj)
+            
+        bot.send_message(chat_id, f"🎉 सफलता! '{filename}' iCloud पर अपलोड हो गई। 🌟")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ अपलोड फेल: {str(e)}")
+    finally:
+        if filename and os.path.exists(filename):
+            os.remove(filename)
+
+# --- Message Handlers ---
+if bot:
+    @bot.message_handler(commands=['list'])
+    def list_files(message):
+        global api
+        if api is None and not init_icloud(message.chat.id): return
         try:
-            icloud = setup_icloud()
-            
-            # yt-dlp की सेटिंग्स
-            ydl_opts = {
-                'format': 'bestaudio/best' if is_audio else 'best',
-                'outtmpl': 'downloaded_media.%(ext)s',
-                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-                'progress_hooks': [lambda d: progress_hook(d, chat_id, msg.message_id)]
-            }
-            
-            # फाइल डाउनलोड करो
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(link, download=True)
-                file_ext = info.get('ext', 'mp3' if is_audio else 'mp4')
-                file_name = f"downloaded_media.{file_ext}"
-                title = info.get('title', 'Media')
-
-            # iCloud पर अपलोड करो
-            bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"☁️ डाउनलोड पूरा हुआ!\nअब '{title}' को iCloud पर अपलोड कर रहा हूँ...")
-            
-            with open(file_name, 'rb') as f:
-                icloud.drive.root.upload(f)
-            
-            # सक्सेस मैसेज और फाइल डिलीट
-            bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"✅ '{title}' सफलतापूर्वक iCloud पर सेव हो गई! 🎉")
-            os.remove(file_name)
-            
+            files = [f['name'] for f in api.drive.root.dir() if f['type'] == 'file']
+            bot.reply_to(message, "📂 फाइल्स:\n\n" + ("\n".join(files) if files else "खाली है।"))
         except Exception as e:
-            bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"❌ कुछ गड़बड़ हो गई: {str(e)}")
-        finally:
-            file_queue.task_done()
+            bot.reply_to(message, f"❌ एरer: {str(e)}")
 
-# --- Message Handler ---
-@bot.message_handler(func=lambda message: "youtube.com" in message.text or "youtu.be" in message.text)
-def handle_yt(message):
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"audio|{message.text}"))
-    markup.add(InlineKeyboardButton("🎥 Video (MP4)", callback_data=f"video|{message.text}"))
-    bot.reply_to(message, "आपको क्या डाउनलोड करना है?", reply_markup=markup)
+    @bot.message_handler(func=lambda message: "youtube.com" in message.text or "youtu.be" in message.text)
+    def handle_yt(message):
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"audio|{message.text}"))
+        markup.add(InlineKeyboardButton("🎥 Video (MP4)", callback_data=f"video|{message.text}"))
+        bot.reply_to(message, "क्या डाउनलोड करना है?", reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: True)
-def callback_query(call):
-    bot.answer_callback_query(call.id, "कतार में जोड़ा जा रहा है...")
-    bot.delete_message(call.message.chat.id, call.message.message_id)
-    
-    data = call.data.split("|")
-    is_audio = data[0] == "audio"
-    link = data[1]
-    
-    file_queue.put({'chat_id': call.message.chat.id, 'link': link, 'is_audio': is_audio})
-    bot.send_message(call.message.chat.id, "📥 लिंक कतार में लग गया है, कृपया इंतज़ार करें।")
+    @bot.callback_query_handler(func=lambda call: True)
+    def callback_query(call):
+        bot.answer_callback_query(call.id)
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        
+        data = call.data.split("|")
+        is_audio = data[0] == "audio"
+        link = data[1]
+        
+        # बिना क्यू के सीधे थ्रेड में चलाओ
+        threading.Thread(target=process_youtube_download, args=(call.message.chat.id, link, is_audio)).start()
 
-# --- Start Threads ---
+    @bot.message_handler(content_types=['photo', 'video', 'document', 'audio'])
+    def handle_files(message):
+        if message.content_type == 'photo': 
+            file_id, name = message.photo[-1].file_id, "photo"
+        elif message.content_type == 'video': 
+            file_id, name = message.video.file_id, "video"
+        elif message.content_type == 'audio': 
+            file_id = message.audio.file_id
+            name = message.audio.file_name.split('.')[0] if message.audio.file_name else "audio"
+        else: 
+            file_id = message.document.file_id
+            name = message.document.file_name.split('.')[0] if message.document.file_name else "doc"
+            
+        threading.Thread(target=process_telegram_upload, args=(message.chat.id, file_id, name)).start()
+
+    @bot.message_handler(content_types=['text'])
+    def handle_text(message):
+        global api, waiting_for_2fa
+        chat_id = message.chat.id
+        text = message.text.strip()
+
+        if waiting_for_2fa:
+            if text.isdigit() and len(text) == 6:
+                bot.send_message(chat_id, "⏳ कोड वेरीफाई हो रहा है...")
+                try:
+                    if api.validate_2fa_code(text):
+                        bot.send_message(chat_id, "✅ 2FA सफल! अब आप फाइल या लिंक भेज सकते हैं।")
+                        waiting_for_2fa = False
+                    else:
+                        bot.send_message(chat_id, "❌ गलत कोड।")
+                except Exception as e:
+                    bot.send_message(chat_id, f"❌ एरर: {str(e)}")
+            return
+        bot.reply_to(message, "👋 प्रो बॉट रेडी है! कोई भी फाइल या YouTube लिंक भेजो।")
+
+def start_bot():
+    if bot:
+        bot.remove_webhook()
+        time.sleep(2) 
+        bot.infinity_polling(skip_pending=True)
+
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=process_queue, daemon=True).start()
-    print("Bot is starting...")
-    bot.infinity_polling()
-
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    start_bot()
