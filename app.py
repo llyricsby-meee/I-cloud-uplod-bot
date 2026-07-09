@@ -1,4 +1,5 @@
 import os
+import time
 import shutil
 import threading
 import telebot
@@ -14,7 +15,13 @@ RENDER_SECRETS_DIR = "/etc/secrets"
 WORKING_COOKIE_DIR = "/tmp/icloud_cookies"
 
 app = Flask(__name__)
-bot = telebot.TeleBot(BOT_TOKEN.strip())
+bot = None
+
+if BOT_TOKEN:
+    try:
+        bot = telebot.TeleBot(BOT_TOKEN.strip())
+    except Exception as e:
+        print(f"❌ बॉट सेट करने में गड़बड़: {str(e)}")
 
 api = None
 waiting_for_2fa = False
@@ -24,75 +31,123 @@ saved_file_type = None
 
 @app.route('/')
 def home():
-    return "Bot is Live!"
+    return "iCloud Pro Bot is Running! 🚀"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 def setup_cookies():
     if not os.path.exists(WORKING_COOKIE_DIR):
         os.makedirs(WORKING_COOKIE_DIR)
     if os.path.exists(RENDER_SECRETS_DIR):
         for filename in os.listdir(RENDER_SECRETS_DIR):
-            shutil.copy2(os.path.join(RENDER_SECRETS_DIR, filename), os.path.join(WORKING_COOKIE_DIR, filename))
+            src = os.path.join(RENDER_SECRETS_DIR, filename)
+            dest = os.path.join(WORKING_COOKIE_DIR, filename)
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, dest)
+                    os.chmod(dest, 0o777)
+                except:
+                    pass
 
 def init_icloud(chat_id):
     global api, waiting_for_2fa
     setup_cookies()
-    api = PyiCloudService(APPLE_ID, APPLE_PASSWORD, cookie_directory=WORKING_COOKIE_DIR)
-    if api.requires_2fa:
-        bot.send_message(chat_id, "🔐 2FA कोड भेजें:")
-        waiting_for_2fa = True
+    try:
+        api = PyiCloudService(APPLE_ID, APPLE_PASSWORD, cookie_directory=WORKING_COOKIE_DIR)
+        if api.requires_2fa:
+            bot.send_message(chat_id, "🔐 कुकी एक्सपायर है या पासवर्ड गलत था। नया 2FA कोड भेजें।")
+            waiting_for_2fa = True
+            return False
+        return True
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ iCloud लॉगिन एरर: {str(e)}")
         return False
-    return True
 
-def upload_file(chat_id, file_id, default_name):
+def upload_after_login(chat_id, file_id, default_name, file_type):
     global api
-    file_info = bot.get_file(file_id)
-    ext = file_info.file_path.split('.')[-1]
-    filename = f"{default_name}.{ext}"
-    downloaded_file = bot.download_file(file_info.file_path)
-    with open(filename, 'wb') as f:
-        f.write(downloaded_file)
-    with open(filename, 'rb') as f:
-        api.drive.root.upload(f)
-    os.remove(filename)
-    bot.send_message(chat_id, "✅ अपलोड सफल!")
+    filename = None
+    try:
+        bot.send_message(chat_id, "⏳ फाइल डाउनलोड हो रही है...")
+        file_info = bot.get_file(file_id)
+        ext = file_info.file_path.split('.')[-1]
+        filename = f"{default_name}_{file_id[:6]}.{ext}"
+        
+        downloaded_file = bot.download_file(file_info.file_path)
+        with open(filename, 'wb') as new_file:
+            new_file.write(downloaded_file)
+            
+        bot.send_message(chat_id, "📥 डाउनलोड पूरा! iCloud Drive पर भेजा जा रहा है...")
+        
+        with open(filename, 'rb') as file_obj:
+            api.drive.root.upload(file_obj)
+            
+        bot.send_message(chat_id, f"🎉 सफलता! '{filename}' iCloud Drive पर अपलोड हो गई। 100 Stars! 🌟")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ अपलोड फेल: {str(e)}")
+    finally:
+        if filename and os.path.exists(filename):
+            os.remove(filename)
 
-@bot.message_handler(content_types=['photo', 'video', 'document', 'audio'])
-def handle_files(message):
-    global api, saved_file_id, saved_file_name
-    chat_id = message.chat.id
-    
-    # फाइल पहचानना
-    file_id = None
-    name = "file"
-    if message.content_type == 'photo':
-        file_id = message.photo[-1].file_id
-    elif message.content_type == 'video':
-        file_id = message.video.file_id
-    elif message.content_type == 'audio':
-        file_id = message.audio.file_id
-        name = message.audio.file_name.split('.')[0] if message.audio.file_name else "audio"
-    else:
-        file_id = message.document.file_id
-        name = message.document.file_name.split('.')[0] if message.document.file_name else "doc"
+if bot:
+    @bot.message_handler(content_types=['text'])
+    def handle_text(message):
+        global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
+        chat_id = message.chat.id
+        text = message.text.strip()
 
-    if api is None:
-        saved_file_id, saved_file_name = file_id, name
-        init_icloud(chat_id)
-    else:
-        upload_file(chat_id, file_id, name)
+        if waiting_for_2fa:
+            if text.isdigit() and len(text) == 6:
+                bot.send_message(chat_id, "⏳ कोड वेरीफाई हो रहा है...")
+                try:
+                    if api.validate_2fa_code(text):
+                        bot.send_message(chat_id, "✅ 2FA सफल!")
+                        waiting_for_2fa = False
+                        if saved_file_id:
+                            upload_after_login(chat_id, saved_file_id, saved_file_name, saved_file_type)
+                            saved_file_id = None
+                    else:
+                        bot.send_message(chat_id, "❌ गलत कोड।")
+                except Exception as e:
+                    bot.send_message(chat_id, f"❌ एरर: {str(e)}")
+            return
+        bot.reply_to(message, "👋 प्रो बॉट रेडी है! फाइल भेजो।")
 
-# 2FA हैंडलर
-@bot.message_handler(func=lambda m: waiting_for_2fa)
-def verify_2fa(message):
-    global waiting_for_2fa
-    if api.validate_2fa_code(message.text):
-        waiting_for_2fa = False
-        bot.send_message(message.chat.id, "✅ 2FA सफल! अपलोड जारी है...")
-        upload_file(message.chat.id, saved_file_id, saved_file_name)
+    def handle_incoming_file(message, file_id, default_name, file_type):
+        global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
+        chat_id = message.chat.id
+        if api is None:
+            saved_file_id = file_id
+            saved_file_name = default_name
+            saved_file_type = file_type
+            init_icloud(chat_id)
+        else:
+            upload_after_login(chat_id, file_id, default_name, file_type)
+
+    @bot.message_handler(content_types=['photo', 'video', 'document', 'audio'])
+    def handle_files(message):
+        if message.content_type == 'photo':
+            handle_incoming_file(message, message.photo[-1].file_id, "photo", "photo")
+        elif message.content_type == 'video':
+            handle_incoming_file(message, message.video.file_id, "video", "video")
+        elif message.content_type == 'document':
+            orig_name = message.document.file_name if message.document.file_name else "doc"
+            name_without_ext = orig_name.split('.')[0]
+            handle_incoming_file(message, message.document.file_id, name_without_ext, "document")
+        elif message.content_type == 'audio':
+            orig_name = message.audio.file_name if message.audio.file_name else "audio"
+            name_without_ext = orig_name.split('.')[0]
+            handle_incoming_file(message, message.audio.file_id, name_without_ext, "audio")
+
+def start_bot():
+    if bot:
+        bot.remove_webhook()
+        time.sleep(2) 
+        bot.infinity_polling(skip_pending=True)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    bot.infinity_polling()
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    start_bot()
