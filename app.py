@@ -2,11 +2,11 @@ import os
 import time
 import shutil
 import threading
+import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyicloud import PyiCloudService
 from flask import Flask
-import yt_dlp
 
 # Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -27,15 +27,12 @@ if BOT_TOKEN:
 
 api = None
 waiting_for_2fa = False
-last_update_time = {}
-
-# 🔥 टेलीग्राम बटन डेटा लिमिट (64 Bytes) को बायपास करने के लिए ग्लोबल स्टोरेज
 current_youtube_link = None 
 
 # --- Flask Server ---
 @app.route('/')
 def home():
-    return "iCloud Pro Bot is Running! 🚀"
+    return "iCloud Pro Bot (Multi-API Auto-Fallback) is Running! 🚀"
 
 def run_flask():
     port = int(os.environ.get('PORT', 5000))
@@ -69,50 +66,100 @@ def init_icloud(chat_id):
         bot.send_message(chat_id, f"❌ iCloud लॉगिन एरर: {str(e)}")
         return False
 
-# --- YouTube Progress Hook ---
-def progress_hook(d, chat_id, message_id):
-    if d['status'] == 'downloading':
-        now = time.time()
-        if now - last_update_time.get(message_id, 0) > 3:
-            p = d.get('_percent_str', 'N/A').strip()
-            s = d.get('_speed_str', 'N/A').strip()
-            try:
-                bot.edit_message_text(
-                    chat_id=chat_id, message_id=message_id, 
-                    text=f"⏳ सर्वर पर डाउनलोड हो रहा है...\n📊 प्रोग्रेस: {p}\n🚀 स्पीड: {s}"
-                )
-                last_update_time[message_id] = now
-            except:
-                pass
+# --- 🔥 Multi-API Fallback Engine (कभी न रुकने वाला सिस्टम) ---
+def get_download_url_with_fallback(link, is_audio):
+    """यह फ़ंक्शन एक-एक करके सभी APIs को ट्राई करेगा"""
+    
+    # --- LAYER 1: Cobalt API ---
+    try:
+        response = requests.post(
+            "https://api.cobalt.tools/api/json", 
+            json={"url": link, "vQuality": "720", "isAudioOnly": is_audio},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=10
+        )
+        if response.status_code == 200 and response.json().get("status") != "error":
+            return response.json().get("url"), "Cobalt Server"
+    except:
+        pass # अगर Cobalt फेल हुआ, तो चुपचाप अगले पर जाओ
 
-# --- Direct Download & Upload Function ---
+    # --- LAYER 2: AllTube API (Backup 1) ---
+    try:
+        # AllTube का फॉर्मेट थोड़ा अलग होता है, यह डायरेक्ट वीडियो/ऑडियो एक्स्ट्रेक्ट करता है
+        api_url = f"https://alltube.herokuapp.com/json?url={link}"
+        response = requests.get(api_url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            # ऑडियो या वीडियो का डायरेक्ट लिंक ढूंढना
+            streams = data.get("formats", [])
+            for stream in streams:
+                if is_audio and "audio" in stream.get("format", "").lower():
+                    return stream.get("url"), "AllTube Audio Server"
+                elif not is_audio and "mp4" in stream.get("ext", "").lower():
+                    return stream.get("url"), "AllTube Video Server"
+            if streams:
+                return streams[0].get("url"), "AllTube Default Server"
+    except:
+        pass
+
+    # --- LAYER 3: Y2Mate Public API Gateway (Backup 2) ---
+    try:
+        # यह एक और यूनिवर्सल बाईपास गेटवे है
+        api_url = "https://tomp3.cc/api/ajax/search"
+        payload = {"query": link, "vt": "home"}
+        res = requests.post(api_url, data=payload, timeout=10)
+        if res.status_code == 200 and res.json().get("status") == "success":
+            # कनवर्टर लिंक निकालना
+            links = res.json().get("links", {})
+            # पहले उपलब्ध लिंक को चुनना
+            for k, v in links.items():
+                for quality_key, quality_val in v.items():
+                    # कन्वर्ट करके डाउनलोड लिंक लेना
+                    convert_url = "https://tomp3.cc/api/ajax/convert"
+                    conv_payload = {"vid": res.json().get("vid"), "k": quality_val.get("k")}
+                    conv_res = requests.post(convert_url, data=conv_payload, timeout=10)
+                    if conv_res.status_code == 200 and conv_res.json().get("status") == "success":
+                        return conv_res.json().get("dlink"), "Tomp3 Premium Server"
+    except:
+        pass
+
+    return None, None
+
+# --- Main YouTube Downloader ---
 def process_youtube_download(chat_id, link, is_audio):
     global api
     if api is None and not init_icloud(chat_id):
         return
 
-    msg = bot.send_message(chat_id, "🚀 YouTube से सीधे डाउनलोडिंग शुरू की जा रही है...")
+    msg = bot.send_message(chat_id, "📡 क्लाउड सर्वर से लिंक जनरेट किया जा रहा है...")
     
     try:
-        ydl_opts = {
-            'format': 'bestaudio/best' if is_audio else 'best',
-            'outtmpl': 'downloaded_media.%(ext)s',
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-            'progress_hooks': [lambda d: progress_hook(d, chat_id, msg.message_id)]
-        }
+        # ऑटो-बैकअप सिस्टम से लिंक ढूंढो
+        download_url, server_name = get_download_url_with_fallback(link, is_audio)
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(link, download=True)
-            file_ext = info.get('ext', 'mp3' if is_audio else 'mp4')
-            file_name = f"downloaded_media.{file_ext}"
-            title = info.get('title', 'Media')
-
-        bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"☁️ '{title}' को iCloud पर अपलोड कर रहा हूँ...")
+        if not download_url:
+            bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text="❌ मेरे सभी 3 बैकअप सर्वर अभी बिजी हैं। कृपया कुछ देर बाद दोबारा लिंक भेजें।")
+            return
+            
+        bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"🚀 {server_name} कनेक्ट हो गया!\n📥 फाइल डाउनलोड की जा रही है...")
         
+        file_ext = "mp3" if is_audio else "mp4"
+        file_name = f"youtube_media.{file_ext}"
+        
+        # रेंडर सर्वर पर फाइल डाउनलोड करना
+        file_response = requests.get(download_url, stream=True)
+        with open(file_name, 'wb') as f:
+            for chunk in file_response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    
+        bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text="☁️ डाउनलोड पूरा! अब iCloud पर अपलोड किया जा रहा है...")
+        
+        # iCloud अपलोड
         with open(file_name, 'rb') as f:
             api.drive.root.upload(f)
-        
-        bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"✅ '{title}' सफलतापूर्वक iCloud पर सेव हो गई! 🎉")
+            
+        bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text=f"✅ सफलता! फाइल सीधे iCloud पर सेव हो गई! 🎉\n(Processed via {server_name})")
         os.remove(file_name)
         
     except Exception as e:
@@ -160,10 +207,9 @@ if bot:
     @bot.message_handler(func=lambda message: "youtube.com" in message.text or "youtu.be" in message.text)
     def handle_yt(message):
         global current_youtube_link
-        current_youtube_link = message.text.strip() # लिंक को यहाँ सुरक्षित रख लिया
+        current_youtube_link = message.text.strip()
         
         markup = InlineKeyboardMarkup()
-        # बटन डेटा को छोटा रखा ताकि 64 bytes की लिमिट कभी न टूटे
         markup.add(InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download_audio"))
         markup.add(InlineKeyboardButton("🎥 Video (MP4)", callback_data="download_video"))
         bot.reply_to(message, "क्या डाउनलोड करना है?", reply_markup=markup)
@@ -179,8 +225,6 @@ if bot:
             return
             
         is_audio = call.data == "download_audio"
-        
-        # सीधे थ्रेड में चलाओ
         threading.Thread(target=process_youtube_download, args=(call.message.chat.id, current_youtube_link, is_audio)).start()
 
     @bot.message_handler(content_types=['photo', 'video', 'document', 'audio'])
