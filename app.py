@@ -1,4 +1,5 @@
 import os
+import time
 import shutil
 import threading
 import telebot
@@ -10,10 +11,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 APPLE_ID = os.environ.get("your_apple_id")
 APPLE_PASSWORD = os.environ.get("your_apple_password")
 
-# 🍪 रेंडर की Secret Files का पाथ जहाँ आपकी कुकी रखी है
 RENDER_SECRETS_DIR = "/etc/secrets"
-
-# 🛠️ वर्किंग पाथ जहाँ कोड कुकी को मॉडिफ़ाई कर पाएगा (Read-Write Allowed)
 WORKING_COOKIE_DIR = "/tmp/icloud_cookies"
 
 app = Flask(__name__)
@@ -23,7 +21,7 @@ if BOT_TOKEN:
     try:
         bot = telebot.TeleBot(BOT_TOKEN.strip())
     except Exception as e:
-        print(f"❌ बॉट इनिशियलाइजेशन में गड़बड़: {str(e)}")
+        print(f"❌ बॉट सेट करने में गड़बड़: {str(e)}")
 
 api = None
 waiting_for_2fa = False
@@ -33,53 +31,45 @@ saved_file_type = None
 
 @app.route('/')
 def home():
-    return "iCloud Read-Write Fixed Bot is Live!"
+    return "iCloud Pro Bot is Running! 🚀"
 
 def run_flask():
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 def setup_cookies():
-    """यह फ़ंक्शन Read-only कुकी को उठाकर लिखने योग्य /tmp फ़ोल्डर में कॉपी करेगा"""
     if not os.path.exists(WORKING_COOKIE_DIR):
         os.makedirs(WORKING_COOKIE_DIR)
-    
-    # रेंडर की सीक्रेट डायरेक्टरी में जो भी कुकीज़ हैं उन्हें /tmp में कॉपी करो
     if os.path.exists(RENDER_SECRETS_DIR):
         for filename in os.listdir(RENDER_SECRETS_DIR):
-            src_file = os.path.join(RENDER_SECRETS_DIR, filename)
-            dest_file = os.path.join(WORKING_COOKIE_DIR, filename)
-            if os.path.isfile(src_file):
+            src = os.path.join(RENDER_SECRETS_DIR, filename)
+            dest = os.path.join(WORKING_COOKIE_DIR, filename)
+            if os.path.isfile(src):
                 try:
-                    shutil.copy2(src_file, dest_file)
-                    # फ़ाइल को पूरी परमिशन दे रहे हैं ताकि एरर न आए
-                    os.chmod(dest_file, 0o777)
-                except Exception as e:
-                    print(f"कुकी कॉपी एरर: {e}")
+                    shutil.copy2(src, dest)
+                    os.chmod(dest, 0o777)
+                except:
+                    pass
 
 def init_icloud(chat_id):
     global api, waiting_for_2fa
+    setup_cookies()
     try:
-        # लॉगिन से पहले कुकीज़ को सही जगह सेटअप करें
-        setup_cookies()
-        
-        # अब यह /tmp वाले फ़ोल्डर से कुकी यूज़ करेगा जहाँ लिखने की आज़ादी है
         api = PyiCloudService(APPLE_ID, APPLE_PASSWORD, cookie_directory=WORKING_COOKIE_DIR)
-        
         if api.requires_2fa:
-            bot.send_message(chat_id, "🔐 कुकी मैच नहीं हुई या एक्सपायर हो गई है। कृपया नया 2FA कोड भेजें।")
+            bot.send_message(chat_id, "🔐 कुकी एक्सपायर है या पासवर्ड गलत था। नया 2FA कोड भेजें। (अगर 'Invalid password' एरर आए, तो रेंडर सेटिंग्स चेक करें!)")
             waiting_for_2fa = True
             return False
         return True
     except Exception as e:
-        bot.send_message(chat_id, f"❌ iCloud लॉगिन एरर: {str(e)}")
+        bot.send_message(chat_id, f"❌ iCloud लॉगिन एरर: {str(e)}\n\n⚠️ भाई, रेंडर के Environment Variables में जाकर अपना पासवर्ड चेक करो, पक्का उसमें कोई गलती है!")
         return False
 
 def upload_after_login(chat_id, file_id, default_name, file_type):
     global api
     filename = None
     try:
-        bot.send_message(chat_id, "⏳ टेलीग्राम से फाइल डाउनलोड की जा रही है...")
+        bot.send_message(chat_id, "⏳ फाइल डाउनलोड हो रही है...")
         file_info = bot.get_file(file_id)
         ext = file_info.file_path.split('.')[-1]
         filename = f"{default_name}_{file_id[:6]}.{ext}"
@@ -88,12 +78,13 @@ def upload_after_login(chat_id, file_id, default_name, file_type):
         with open(filename, 'wb') as new_file:
             new_file.write(downloaded_file)
             
-        bot.send_message(chat_id, "📥 डाउनलोड पूरा! अब सुरक्षित कुकी के ज़रिए iCloud Drive पर भेजा जा रहा है...")
+        bot.send_message(chat_id, "📥 डाउनलोड पूरा! iCloud Drive पर भेजा जा रहा है...")
         
+        # 🔥 422 एरर फिक्स: iCloud के रूट फोल्डर को सही तरीके से टारगेट करना
         with open(filename, 'rb') as file_obj:
-            api.drive.upload_file(file_obj, filename=filename)
+            api.drive.root.upload(file_obj)
             
-        bot.send_message(chat_id, f"🎉 सफलता! '{filename}' आपके iCloud Drive पर सीधे अपलोड हो गई है।")
+        bot.send_message(chat_id, f"🎉 सफलता! '{filename}' iCloud Drive पर अपलोड हो गई। 100 Stars! 🌟")
     except Exception as e:
         bot.send_message(chat_id, f"❌ अपलोड फेल: {str(e)}")
     finally:
@@ -109,7 +100,7 @@ if bot:
 
         if waiting_for_2fa:
             if text.isdigit() and len(text) == 6:
-                bot.send_message(chat_id, "⏳ कोड वेरीफाई किया जा रहा है...")
+                bot.send_message(chat_id, "⏳ कोड वेरीफाई हो रहा है...")
                 try:
                     if api.validate_2fa_code(text):
                         bot.send_message(chat_id, "✅ 2FA सफल!")
@@ -122,13 +113,11 @@ if bot:
                 except Exception as e:
                     bot.send_message(chat_id, f"❌ एरर: {str(e)}")
             return
-
-        bot.reply_to(message, "👋 नमस्ते भाई! कुकीज़ लोड हो चुकी हैं। मुझे कोई भी फाइल भेजो, बिना 2FA के अपलोड हो जाएगी!")
+        bot.reply_to(message, "👋 प्रो बॉट रेडी है! फाइल भेजो।")
 
     def handle_incoming_file(message, file_id, default_name, file_type):
         global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
         chat_id = message.chat.id
-        
         if api is None:
             saved_file_id = file_id
             saved_file_name = default_name
@@ -148,8 +137,15 @@ if bot:
             name_without_ext = orig_name.split('.')[0]
             handle_incoming_file(message, message.document.file_id, name_without_ext, "document")
 
+def start_bot():
+    if bot:
+        # 🔥 409 Conflict फिक्स: पुरानी वेबहुक/कनेक्शन को साफ़ करना
+        bot.remove_webhook()
+        time.sleep(2) 
+        bot.infinity_polling(skip_pending=True)
+
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-    bot.infinity_polling(skip_pending=True)
+    start_bot()
