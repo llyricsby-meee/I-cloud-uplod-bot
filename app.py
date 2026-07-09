@@ -29,6 +29,9 @@ api = None
 waiting_for_2fa = False
 last_update_time = {}
 
+# 🔥 टेलीग्राम बटन डेटा लिमिट (64 Bytes) को बायपास करने के लिए ग्लोबल स्टोरेज
+current_youtube_link = None 
+
 # --- Flask Server ---
 @app.route('/')
 def home():
@@ -152,26 +155,33 @@ if bot:
             files = [f['name'] for f in api.drive.root.dir() if f['type'] == 'file']
             bot.reply_to(message, "📂 फाइल्स:\n\n" + ("\n".join(files) if files else "खाली है।"))
         except Exception as e:
-            bot.reply_to(message, f"❌ एरer: {str(e)}")
+            bot.reply_to(message, f"❌ एरर: {str(e)}")
 
     @bot.message_handler(func=lambda message: "youtube.com" in message.text or "youtu.be" in message.text)
     def handle_yt(message):
+        global current_youtube_link
+        current_youtube_link = message.text.strip() # लिंक को यहाँ सुरक्षित रख लिया
+        
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"audio|{message.text}"))
-        markup.add(InlineKeyboardButton("🎥 Video (MP4)", callback_data=f"video|{message.text}"))
+        # बटन डेटा को छोटा रखा ताकि 64 bytes की लिमिट कभी न टूटे
+        markup.add(InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download_audio"))
+        markup.add(InlineKeyboardButton("🎥 Video (MP4)", callback_data="download_video"))
         bot.reply_to(message, "क्या डाउनलोड करना है?", reply_markup=markup)
 
-    @bot.callback_query_handler(func=lambda call: True)
+    @bot.callback_query_handler(func=lambda call: call.data in ["download_audio", "download_video"])
     def callback_query(call):
+        global current_youtube_link
         bot.answer_callback_query(call.id)
         bot.delete_message(call.message.chat.id, call.message.message_id)
         
-        data = call.data.split("|")
-        is_audio = data[0] == "audio"
-        link = data[1]
+        if not current_youtube_link:
+            bot.send_message(call.message.chat.id, "❌ लिंक खो गया है, कृपया दोबारा भेजें।")
+            return
+            
+        is_audio = call.data == "download_audio"
         
-        # बिना क्यू के सीधे थ्रेड में चलाओ
-        threading.Thread(target=process_youtube_download, args=(call.message.chat.id, link, is_audio)).start()
+        # सीधे थ्रेड में चलाओ
+        threading.Thread(target=process_youtube_download, args=(call.message.chat.id, current_youtube_link, is_audio)).start()
 
     @bot.message_handler(content_types=['photo', 'video', 'document', 'audio'])
     def handle_files(message):
