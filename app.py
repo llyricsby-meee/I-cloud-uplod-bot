@@ -1,54 +1,38 @@
-import subprocess
-import sys
 import os
-
-# वर्सल के नखरेबाज़ पैकेज मैनेजर को बायपास करके रनटाइम पर pyicloud इंस्टॉल करना
-try:
-    import pyicloud
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyicloud==1.1.0"])
-
+import threading
 import telebot
-from yt_dlp import YoutubeDL
 from pyicloud import PyiCloudService
-from flask import Flask, request
+from flask import Flask
 
-# Flask ऐप सेटअप (वर्सल को शांत रखने के लिए)
-app = Flask(__name__)
-
-# वर्सल के डैशबोर्ड से वेरिएबल्स उठाना
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-APPLE_ID = os.environ.get("your_apple_id", "your_apple_id@email.com")
-APPLE_PASSWORD = os.environ.get("your_apple_password", "your_apple_password")
+# Variables - ये हम रेंडर के Environment Variables में डालेंगे
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+APPLE_ID = os.environ.get("your_apple_id")
+APPLE_PASSWORD = os.environ.get("your_apple_password")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
 
-# ग्लोबल वेरिएबल ताकि लॉगिन स्टेट याद रहे
 api = None
 waiting_for_2fa = False
+saved_file_id = None
+saved_file_name = None
+saved_file_type = None
 
-# वर्सल के लिए एक डमी होम पेज ताकि एरर न आए
 @app.route('/')
 def home():
-    return "iCloud Upload Bot is Running Live!"
+    return "iCloud Direct File Upload Bot is Live on Render!"
 
-# वर्सल जब भी जागता है, इस रूट पर टेलीग्राम के अपडेट्स आ सकते हैं
-@app.route('/' + BOT_TOKEN, methods=['POST'])
-def getMessage():
-    json_string = request.get_data().decode('utf-8')
-    update = telebot.types.Update.de_json(json_string)
-    bot.process_new_updates([update])
-    return "!", 200
+def run_flask():
+    # रेंडर खुद 'PORT' वेरिएबल देता है, अगर न मिले तो 5000 पर चलेगा
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 def init_icloud(chat_id):
     global api, waiting_for_2fa
     try:
-        bot.send_message(chat_id, "iCloud से कनेक्ट करने की कोशिश की जा रही है...")
         api = PyiCloudService(APPLE_ID, APPLE_PASSWORD)
-        
-        # अगर टू-फैक्टर ऑथेंटिकेशन (2FA) चालू है
         if api.requires_2fa:
-            bot.send_message(chat_id, "🔐 Apple ID को 2FA कोड की ज़रूरत है। आपके Apple डिवाइस पर एक कोड आया होगा। कृपया वह 6-डिजिट का कोड यहाँ चैट में टाइप करके भेजें।")
+            bot.send_message(chat_id, "🔐 Apple ID को 2FA कोड की ज़रूरत है। आपके Apple डिवाइस पर एक कोड आया होगा। कृपया वह 6-डिजिट का कोड यहाँ भेजें।")
             waiting_for_2fa = True
             return False
         return True
@@ -56,68 +40,96 @@ def init_icloud(chat_id):
         bot.send_message(chat_id, f"❌ iCloud लॉगिन एरर: {str(e)}")
         return False
 
-@bot.message_handler(func=lambda message: True)
-def handle_all_messages(message):
-    global api, waiting_for_2fa
+def upload_after_login(chat_id, file_id, default_name, file_type):
+    try:
+        bot.send_message(chat_id, "⏳ फाइल डाउनलोड की जा रही है...")
+        file_info = bot.get_file(file_id)
+        ext = file_info.file_path.split('.')[-1]
+        filename = f"{default_name}_{file_id[:6]}.{ext}"
+        
+        downloaded_file = bot.download_file(file_info.file_path)
+        with open(filename, 'wb') as new_file:
+            new_file.write(downloaded_file)
+            
+        bot.send_message(chat_id, "📥 डाउनलोड पूरा! अब iCloud Drive पर अपलोड हो रहा है...")
+        with open(filename, 'rb') as file_obj:
+            api.drive.upload_file(file_obj)
+            
+        bot.send_message(chat_id, f"🎉 सफलता! '{filename}' आपके iCloud Drive पर अपलोड हो गई है।")
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ अपलोड फेल: {str(e)}")
+    finally:
+        if 'filename' in locals() and os.path.exists(filename):
+            os.remove(filename)
+
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
     chat_id = message.chat.id
     text = message.text.strip()
 
-    # अगर बॉट आपके 2FA कोड का इंतज़ार कर रहा है
     if waiting_for_2fa:
         if text.isdigit() and len(text) == 6:
-            bot.send_message(chat_id, "कोड को वेरीफाई किया जा रहा है...")
-            result = api.validate_2fa_code(text)
-            if result:
-                bot.send_message(chat_id, "✅ 2FA वेरिफिकेशन सफल! आपका iCloud अब कनेक्टेड है।")
-                waiting_for_2fa = False
-            else:
-                bot.send_message(chat_id, "❌ गलत कोड। कृपया सही 6-डिजिट का कोड दोबारा भेजें।")
+            bot.send_message(chat_id, "⏳ कोड को वेरीफाई किया जा रहा है...")
+            try:
+                if api.validate_2fa_code(text):
+                    bot.send_message(chat_id, "✅ 2FA वेरिफिकेशन सफल!")
+                    waiting_for_2fa = False
+                    if saved_file_id:
+                        upload_after_login(chat_id, saved_file_id, saved_file_name, saved_file_type)
+                        saved_file_id = None
+                else:
+                    bot.send_message(chat_id, "❌ गलत कोड। कृपया दोबारा सही कोड भेजें।")
+            except Exception as e:
+                bot.send_message(chat_id, f"❌ एरर: {str(e)}")
         else:
-            bot.send_message(chat_id, "⚠️ कृपया केवल 6 अंकों का संख्यात्मक (Numeric) कोड ही भेजें।")
+            bot.send_message(chat_id, "⚠️ कृपया केवल 6 अंकों का कोड भेजें।")
         return
 
-    # अगर सामान्य YouTube लिंक आता है
-    if "youtube.com" in text or "youtu.be" in text:
-        bot.reply_to(message, "⏳ वीडियो डाउनलोड होना शुरू हो गया है, कृपया इंतज़ार करें...")
-        
-        filename = f"video_{chat_id}.mp4"
-        ydl_opts = {
-            'outtmpl': filename, 
-            'format': 'best[ext=mp4]/best', 
-        }
-        
-        # 1. यूट्यूब से वीडियो डाउनलोड
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                ydl.download([text])
-        except Exception as e:
-            bot.reply_to(message, f"❌ यूट्यूब डाउनलोड फेल: {str(e)}")
-            return
+    bot.reply_to(message, "👋 नमस्ते भाई! रेंडर पर बॉट एकदम रेडी है। मुझे सीधे कोई भी फोटो, वीडियो या फाइल भेजो, मैं उसे आपके iCloud Drive पर अपलोड कर दूंगा!")
 
-        bot.reply_to(message, "📥 डाउनलोड पूरा हुआ! अब इसे आपके iCloud Drive पर अपलोड किया जा रहा है...")
-
-        # 2. iCloud पर अपलोड की प्रक्रिया
-        try:
-            if api is None or api.requires_2fa:
-                success = init_icloud(chat_id)
-                if not success:
-                    if os.path.exists(filename): os.remove(filename)
-                    return
-
-            with open(filename, 'rb') as file_obj:
-                api.drive.upload_file(file_obj)
-                
-            bot.reply_to(message, "🎉 वीडियो सफलतापूर्वक आपके iCloud पर अपलोड हो गया है! अब आप इसे अपने टैबलेट पर देख सकते हैं।")
-            
-        except Exception as e:
-            bot.reply_to(message, f"❌ iCloud अपलोड फेल हुआ: {str(e)}")
-        finally:
-            if os.path.exists(filename):
-                os.remove(filename)
+def handle_incoming_file(message, file_id, default_name, file_type):
+    global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
+    chat_id = message.chat.id
+    
+    if api is None:
+        saved_file_id = file_id
+        saved_file_name = default_name
+        saved_file_type = file_type
+        init_icloud(chat_id)
+    elif api.requires_2fa:
+        saved_file_id = file_id
+        saved_file_name = default_name
+        saved_file_type = file_type
+        waiting_for_2fa = True
+        bot.send_message(chat_id, "🔐 Apple ID का सेशन समाप्त हो गया है। कृपया नया 2FA कोड भेजें।")
     else:
-        bot.reply_to(message, "👋 नमस्ते! कृपया मुझे कोई भी YouTube लिंक भेजें, मैं उसे डाउनलोड करके आपके iCloud पर डाल दूँगा।")
+        upload_after_login(chat_id, file_id, default_name, file_type)
 
-# लोकल टेस्टिंग के लिए (यह हिस्सा वर्सल इग्नोर कर देगा)
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    handle_incoming_file(message, message.photo[-1].file_id, "photo", "photo")
+
+@bot.message_handler(content_types=['video'])
+def handle_video(message):
+    handle_incoming_file(message, message.video.file_id, "video", "video")
+
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    orig_name = message.document.file_name if message.document.file_name else "doc"
+    name_without_ext = orig_name.split('.')[0]
+    handle_incoming_file(message, message.document.file_id, name_without_ext, "document")
+
 if __name__ == "__main__":
-    print("बॉट शुरू हो चुका है...")
-    app.run(host="0.0.0.0", port=int(os.environ.get('PORT', 5000)))
+    try:
+        bot.remove_webhook()
+    except:
+        pass
+
+    # Flask को रेंडर के लिए बैकग्राउंड में चलाना
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    print("टेलीग्राम बॉट रेंडर पर शुरू हो चुका है...")
+    bot.infinity_polling(skip_pending=True)
