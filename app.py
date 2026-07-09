@@ -4,13 +4,21 @@ import telebot
 from pyicloud import PyiCloudService
 from flask import Flask
 
-# Variables - ये हम रेंडर के Environment Variables में डालेंगे
+# Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 APPLE_ID = os.environ.get("your_apple_id")
 APPLE_PASSWORD = os.environ.get("your_apple_password")
 
-bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+bot = None
+
+if BOT_TOKEN:
+    try:
+        bot = telebot.TeleBot(BOT_TOKEN.strip())
+    except Exception as e:
+        print(f"❌ बॉट इनिशियलाइजेशन में गड़बड़: {str(e)}")
+else:
+    print("⚠️ BOT_TOKEN गायब है!")
 
 api = None
 waiting_for_2fa = False
@@ -20,10 +28,11 @@ saved_file_type = None
 
 @app.route('/')
 def home():
-    return "iCloud Direct File Upload Bot is Live on Render!"
+    if bot:
+        return "iCloud Direct File Upload Bot is Live on Render!"
+    return "BOT_TOKEN is missing!"
 
 def run_flask():
-    # रेंडर खुद 'PORT' वेरिएबल देता है, अगर न मिले तो 5000 पर चलेगा
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
@@ -41,6 +50,8 @@ def init_icloud(chat_id):
         return False
 
 def upload_after_login(chat_id, file_id, default_name, file_type):
+    global api
+    filename = None
     try:
         bot.send_message(chat_id, "⏳ फाइल डाउनलोड की जा रही है...")
         file_info = bot.get_file(file_id)
@@ -52,81 +63,90 @@ def upload_after_login(chat_id, file_id, default_name, file_type):
             new_file.write(downloaded_file)
             
         bot.send_message(chat_id, "📥 डाउनलोड पूरा! अब iCloud Drive पर अपलोड हो रहा है...")
+        
+        # फिक्स: pyicloud में फाइल अपलोड करने का सही तरीका
         with open(filename, 'rb') as file_obj:
+            # यह सीधे रूट (iCloud Drive) पर फाइल अपलोड कर देगा
             api.drive.upload_file(file_obj)
             
         bot.send_message(chat_id, f"🎉 सफलता! '{filename}' आपके iCloud Drive पर अपलोड हो गई है।")
+    except AttributeError:
+        # अगर पुराने तरीके से फेल हुआ, तो यह दूसरा तरीका ट्राई करेगा (जो नए वर्जन में चलता है)
+        try:
+            if filename and os.path.exists(filename):
+                with open(filename, 'rb') as file_obj:
+                    api.drive.root.upload_file(file_obj)
+                bot.send_message(chat_id, f"🎉 सफलता (Alt Mode)! '{filename}' आपके iCloud Drive पर अपलोड हो गई है।")
+            else:
+                bot.send_message(chat_id, "❌ फाइल लोकल में नहीं मिली।")
+        except Exception as e2:
+            bot.send_message(chat_id, f"❌ दोनों तरीके फेल हो गए भाई: {str(e2)}")
     except Exception as e:
         bot.send_message(chat_id, f"❌ अपलोड फेल: {str(e)}")
     finally:
-        if 'filename' in locals() and os.path.exists(filename):
+        if filename and os.path.exists(filename):
             os.remove(filename)
 
-@bot.message_handler(content_types=['text'])
-def handle_text(message):
-    global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
-    chat_id = message.chat.id
-    text = message.text.strip()
+if bot:
+    @bot.message_handler(content_types=['text'])
+    def handle_text(message):
+        global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
+        chat_id = message.chat.id
+        text = message.text.strip()
 
-    if waiting_for_2fa:
-        if text.isdigit() and len(text) == 6:
-            bot.send_message(chat_id, "⏳ कोड को वेरीफाई किया जा रहा है...")
-            try:
-                if api.validate_2fa_code(text):
-                    bot.send_message(chat_id, "✅ 2FA वेरिफिकेशन सफल!")
-                    waiting_for_2fa = False
-                    if saved_file_id:
-                        upload_after_login(chat_id, saved_file_id, saved_file_name, saved_file_type)
-                        saved_file_id = None
-                else:
-                    bot.send_message(chat_id, "❌ गलत कोड। कृपया दोबारा सही कोड भेजें।")
-            except Exception as e:
-                bot.send_message(chat_id, f"❌ एरर: {str(e)}")
+        if waiting_for_2fa:
+            if text.isdigit() and len(text) == 6:
+                bot.send_message(chat_id, "⏳ कोड को वेरीफाई किया जा रहा है...")
+                try:
+                    if api.validate_2fa_code(text):
+                        bot.send_message(chat_id, "✅ 2FA वेरिफिकेशन सफल!")
+                        waiting_for_2fa = False
+                        if saved_file_id:
+                            upload_after_login(chat_id, saved_file_id, saved_file_name, saved_file_type)
+                            saved_file_id = None
+                    else:
+                        bot.send_message(chat_id, "❌ गलत कोड। कृपया दोबारा सही कोड भेजें।")
+                except Exception as e:
+                    bot.send_message(chat_id, f"❌ एरर: {str(e)}")
+            else:
+                bot.send_message(chat_id, "⚠️ कृपया केवल 6 अंकों का कोड भेजें।")
+            return
+
+        bot.reply_to(message, "👋 नमस्ते भाई! रेंडर पर बॉट एकदम रेडी है। मुझे सीधे कोई भी फोटो, वीडियो या फाइल भेजो, मैं उसे आपके iCloud Drive पर अपलोड कर दूंगा!")
+
+    def handle_incoming_file(message, file_id, default_name, file_type):
+        global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
+        chat_id = message.chat.id
+        
+        if api is None:
+            saved_file_id = file_id
+            saved_file_name = default_name
+            saved_file_type = file_type
+            init_icloud(chat_id)
+        elif api.requires_2fa:
+            saved_file_id = file_id
+            saved_file_name = default_name
+            saved_file_type = file_type
+            waiting_for_2fa = True
+            bot.send_message(chat_id, "🔐 Apple ID का सेशन समाप्त हो गया है। कृपया नया 2FA कोड भेजें।")
         else:
-            bot.send_message(chat_id, "⚠️ कृपया केवल 6 अंकों का कोड भेजें।")
-        return
+            upload_after_login(chat_id, file_id, default_name, file_type)
 
-    bot.reply_to(message, "👋 नमस्ते भाई! रेंडर पर बॉट एकदम रेडी है। मुझे सीधे कोई भी फोटो, वीडियो या फाइल भेजो, मैं उसे आपके iCloud Drive पर अपलोड कर दूंगा!")
+    @bot.message_handler(content_types=['photo'])
+    def handle_photo(message):
+        handle_incoming_file(message, message.photo[-1].file_id, "photo", "photo")
 
-def handle_incoming_file(message, file_id, default_name, file_type):
-    global api, waiting_for_2fa, saved_file_id, saved_file_name, saved_file_type
-    chat_id = message.chat.id
-    
-    if api is None:
-        saved_file_id = file_id
-        saved_file_name = default_name
-        saved_file_type = file_type
-        init_icloud(chat_id)
-    elif api.requires_2fa:
-        saved_file_id = file_id
-        saved_file_name = default_name
-        saved_file_type = file_type
-        waiting_for_2fa = True
-        bot.send_message(chat_id, "🔐 Apple ID का सेशन समाप्त हो गया है। कृपया नया 2FA कोड भेजें।")
-    else:
-        upload_after_login(chat_id, file_id, default_name, file_type)
+    @bot.message_handler(content_types=['video'])
+    def handle_video(message):
+        handle_incoming_file(message, message.video.file_id, "video", "video")
 
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    handle_incoming_file(message, message.photo[-1].file_id, "photo", "photo")
-
-@bot.message_handler(content_types=['video'])
-def handle_video(message):
-    handle_incoming_file(message, message.video.file_id, "video", "video")
-
-@bot.message_handler(content_types=['document'])
-def handle_document(message):
-    orig_name = message.document.file_name if message.document.file_name else "doc"
-    name_without_ext = orig_name.split('.')[0]
-    handle_incoming_file(message, message.document.file_id, name_without_ext, "document")
+    @bot.message_handler(content_types=['document'])
+    def handle_document(message):
+        orig_name = message.document.file_name if message.document.file_name else "doc"
+        name_without_ext = orig_name.split('.')[0]
+        handle_incoming_file(message, message.document.file_id, name_without_ext, "document")
 
 if __name__ == "__main__":
-    try:
-        bot.remove_webhook()
-    except:
-        pass
-
-    # Flask को रेंडर के लिए बैकग्राउंड में चलाना
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
