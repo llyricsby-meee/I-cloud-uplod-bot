@@ -1,5 +1,5 @@
-Telethon==1.35.0
-pyicloud==1.1.0
-requests==2.31.0
-Flask==3.0.2
-cryptography==42.0.5
+Telethon
+pyicloud
+requests
+Flask
+cryptography
