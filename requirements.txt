@@ -3,3 +3,4 @@ pyicloud
 requests
 Flask
 cryptography
+yt-dlp
