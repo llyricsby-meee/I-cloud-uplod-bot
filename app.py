@@ -8,28 +8,29 @@ from threading import Thread
 from telethon import TelegramClient, events
 from pyicloud import PyiCloudService
 
-# --- SAFE Environment Variables ---
-# अब ये चाबियां पूरी तरह सुरक्षित हैं और कोड इन्हें सीधे Render के Environment से उठाएगा।
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH").strip()
+# --- Environment Variables ---
+API_ID = int(os.environ.get("API_ID", 31642646))
+API_HASH = os.environ.get("API_HASH", "77a04ec35abcf9682826f91d7ddcf1bb").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN") # रेंडर से तुम्हारा बॉट टोकन उठाएगा
 APPLE_ID = os.environ.get("your_apple_id")
 APPLE_PASSWORD = os.environ.get("your_apple_password")
 
 RENDER_SECRETS_DIR = "/etc/secrets"
 WORKING_COOKIE_DIR = "/tmp/icloud_cookies"
 
-# Flask Server SETUP (Render को एक्टिव रखने के लिए)
+# Flask Server (Render को जिंदा रखने के लिए)
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Telethon iCloud Premium Userbot is Running Securely! 🚀"
+    return "Telethon iCloud Bot is Running Smoothly! 🚀"
 
 def run_flask():
     port = int(os.environ.get('PORT', 5000))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-# Telethon Client Initialization
-client = TelegramClient('icloud_userbot_session', API_ID, API_HASH)
+# --- TELETHON CLIENT (लॉगिन एरर फिक्स के साथ) ---
+# यहाँ हमने bot_token को सीधे पास कर दिया है, अब यह कोई फोन नंबर नहीं मांगेगा!
+client = TelegramClient('icloud_bot_session', API_ID, API_HASH)
 api = None
 waiting_for_2fa = False
 
@@ -53,15 +54,15 @@ async def init_icloud(event):
     try:
         api = PyiCloudService(APPLE_ID, APPLE_PASSWORD, cookie_directory=WORKING_COOKIE_DIR)
         if api.requires_2fa:
-            await event.respond("🔐 कुकी एक्सपायर है या नया लॉगिन है। कृपया अपना 6-digit Apple 2FA कोड यहाँ भेजें।")
+            await event.respond("🔐 कुकी एक्सपायर है। कृपया अपना 6-digit Apple 2FA कोड यहाँ भेजें।")
             waiting_for_2fa = True
             return False
         return True
     except Exception as e:
-        await event.respond(f"❌ iCloud लॉगिन एरर: {str(e)}\nकृपया Render पर Apple ID/Password चेक करें।")
+        await event.respond(f"❌ iCloud लॉगिन एरर: {str(e)}")
         return False
 
-# --- Multi-API YouTube Fallback Engine ---
+# --- Fallback Engine ---
 def get_download_url_with_fallback(link, is_audio):
     try:
         response = requests.post(
@@ -90,10 +91,9 @@ def get_download_url_with_fallback(link, is_audio):
                 return streams[0].get("url"), "AllTube Default Server"
     except:
         pass
-
     return None, None
 
-# --- PROCESSORS ---
+# --- Processors ---
 async def process_youtube_download(event, link, is_audio):
     global api
     msg = await event.respond("📡 क्लाउड सर्वर से YouTube लिंक बाईपास किया जा रहा है...")
@@ -102,13 +102,13 @@ async def process_youtube_download(event, link, is_audio):
     download_url, server_name = await loop.run_in_executor(None, get_download_url_with_fallback, link, is_audio)
     
     if not download_url:
-        await msg.edit("❌ यूट्यूब सर्वर्स अभी व्यस्त हैं। कृपया थोड़ी देर बाद प्रयास करें।")
+        await msg.edit("❌ सर्वर्स अभी व्यस्त हैं। कृपया थोड़ी देर बाद प्रयास करें।")
         return
         
-    await msg.edit(f"🚀 {server_name} कनेक्टेड!\n📥 बड़ी फाइल को सीधे सर्वर पर स्ट्रीम किया जा रहा है...")
+    await msg.edit(f"🚀 {server_name} कनेक्टेड!\n📥 बड़ी फाइल को सीधे स्ट्रीम किया जा रहा है...")
     
     file_ext = "mp3" if is_audio else "mp4"
-    file_name = f"yt_stream_{int(time.time())}.{file_ext}"
+    file_name = f"yt_{int(time.time())}.{file_ext}"
     
     try:
         def download_file():
@@ -119,33 +119,27 @@ async def process_youtube_download(event, link, is_audio):
                         if chunk: f.write(chunk)
                         
         await loop.run_in_executor(None, download_file)
-        await msg.edit("☁️ स्ट्रीम पूरी हुई! अब बिना RAM भरे इसे iCloud Drive पर भेजा जा रहा है...")
+        await msg.edit("☁️ ट्रांसफर सफल! अब बिना RAM क्रैश किए इसे iCloud Drive पर भेजा जा रहा है...")
         
         await loop.run_in_executor(None, api.drive.root.upload, open(file_name, 'rb'))
-        await msg.edit(f"✅ सफलता! वीडियो/ऑдио सीधा iCloud पर स्टोर हो गया! 🎉\n(स्रोतः {server_name})")
+        await msg.edit(f"✅ सफलता! वीडियो/ऑडियो सीधे तुम्हारे बॉट के जरिए iCloud पर स्टोर हो गया! 🎉")
     except Exception as e:
         await msg.edit(f"❌ गड़बड़ हुई: {str(e)}")
     finally:
         if os.path.exists(file_name):
             os.remove(file_name)
 
-# --- TELEGRAM INCOMING FILE HANDLER (NO LIMIT) ---
 async def process_telegram_upload(event, message):
     global api
-    msg = await event.respond("⏳ Telethon इंजन एक्टिवेटेड। टेलीग्राम से फाइल सीधे स्ट्रीम हो रही है...")
+    msg = await event.respond("⏳ टेलीथॉन इंजन एक्टिवेटेड। फाइल डाउनलोड हो रही है...")
     
-    file_name = "telegram_file"
-    if message.file and message.file.name:
-        file_name = message.file.name
-    else:
-        ext = message.file.ext if message.file and message.file.ext else ".bin"
-        file_name = f"file_{int(time.time())}{ext}"
+    file_name = message.file.name if message.file and message.file.name else f"file_{int(time.time())}{message.file.ext or '.bin'}"
 
     try:
-        await msg.edit(f"📥 डाउनलोडिंग '{file_name}' (बिना किसी MB लिमिट के डायरेक्ट स्ट्रीम)...")
+        await msg.edit(f"📥 डाउनलोडिंग '{file_name}' (यह बिना किसी 20MB लिमिट के डायरेक्ट हो रहा है)...")
         path = await message.download_media(file=file_name)
         
-        await msg.edit("📥 ट्रांसफर सफल! अब इसे iCloud पर एक्सपोर्ट किया जा रहा है...")
+        await msg.edit("📥 अब इसे सुरक्षित iCloud पर एक्सपोर्ट किया जा रहा है...")
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, api.drive.root.upload, open(path, 'rb'))
         
@@ -156,14 +150,13 @@ async def process_telegram_upload(event, message):
         if os.path.exists(file_name):
             os.remove(file_name)
 
-# --- 100% LOCKED SECURITY FILTER (Only Listens to your Saved Messages) ---
-@client.on(events.NewMessage(chats='me'))
-async def handles_everything_safely(event):
+# --- बॉट इवेंट्स हैंडलर ---
+@client.on(events.NewMessage)
+async def handles_bot_messages(event):
     global api, waiting_for_2fa
     message = event.message
     text = message.raw_text.strip() if message.raw_text else ""
 
-    # Check 2FA Code
     if waiting_for_2fa:
         if text.isdigit() and len(text) == 6:
             await event.respond("⏳ Apple 2FA कोड वेरीफाई हो रहा है...")
@@ -171,30 +164,27 @@ async def handles_everything_safely(event):
                 loop = asyncio.get_event_loop()
                 success = await loop.run_in_executor(None, api.validate_2fa_code, text)
                 if success:
-                    await event.respond("✅ iCloud 2FA सफल! आपका सुरक्षा कवच एक्टिव है।")
+                    await event.respond("✅ iCloud 2FA सफल! अब फाइल या लिंक भेजें।")
                     waiting_for_2fa = False
                 else:
-                    await event.respond("❌ गलत कोड। कृपया दोबारा सही कोड भेजें।")
+                    await event.respond("❌ गलत कोड।")
             except Exception as e:
                 await event.respond(f"❌ एरर: {str(e)}")
         return
 
-    # Initialize iCloud on demand if not ready
     if api is None:
         initialized = await init_icloud(event)
         if not initialized: return
 
-    # Command: List Files
     if text == "/list":
         try:
             loop = asyncio.get_event_loop()
             files = [f['name'] for f in api.drive.root.dir() if f['type'] == 'file']
-            await event.respond("📂 आपके iCloud की फाइल्स:\n\n" + ("\n".join(files) if files else "फोल्डर खाली है।"))
+            await event.respond("📂 आपकी फाइल्स:\n\n" + ("\n".join(files) if files else "खाली है।"))
         except Exception as e:
-            await event.respond(f"❌ लिस्ट लोड करने में एरर: {str(e)}")
+            await event.respond(f"❌ लिस्ट लोड एरर: {str(e)}")
         return
 
-    # YouTube Link Detection
     if "youtube.com" in text or "youtu.be" in text:
         if "/audio" in text:
             clean_link = text.replace("/audio", "").strip()
@@ -204,16 +194,15 @@ async def handles_everything_safely(event):
             asyncio.create_task(process_youtube_download(event, clean_link, is_audio=False))
         return
 
-    # Direct File Upload (Photo, Video, Voice, Audio, Documents)
     if message.file:
         asyncio.create_task(process_telegram_upload(event, message))
         return
 
-# --- STARTUP ENGINE ---
+# --- START BOT AS A BOT TOKEN ---
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
-    
-    print("⚡ Telethon Userbot शुरू हो रहा है...")
-    client.start()
-    print("🚀 यूज़रबॉट सफलतापूर्ण लॉग-इन हो गया! केवल अपने Saved Messages में टेस्ट करें।")
+    print("⚡ Telethon Bot starting via Token...")
+    # यहाँ हमने client.start() में bot_token दे दिया है जिससे टर्मिनल में इनपुट नहीं मांगेगा!
+    client.start(bot_token=BOT_TOKEN.strip()) 
+    print("🚀 बॉट टोकन के जरिए सफलतापूर्वक लाइव हो गया!")
     client.run_until_disconnected()
